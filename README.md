@@ -4,13 +4,17 @@ A distributed file system written in Go, built incrementally.
 
 ## Development Progress
 
-### Week 1: Project Skeleton & P2P Interfaces
-In the first week, we laid down the foundational boilerplate and abstractions to build the network on top of:
+### Week 1: Project Skeleton, P2P Interfaces & TCP Transport
+In the first week, we laid down the foundational boilerplate, core abstractions, and a fully working TCP transport layer:
 
-- **Project Scaffold:** Initialized the Go module (`github.com/Sambodhi-Roy/weaveFS`) and set up a cross-platform Windows/Linux `Makefile`.
-- **P2P Interfaces:** Defined the core `Peer` and `Transport` interfaces in the `p2p/` package to decouple the networking logic from the application logic.
-- **RPC Structure:** Added the base `RPC` message struct that will handle incoming messages and streaming states.
-- **Entry Point:** Set up a `main.go` entry point that compiles successfully to verify our build pipeline.
+- **Project Scaffold:** Initialized the Go module (`github.com/Sambodhi-Roy/weaveFS`) and set up a `Makefile` with `build`, `run`, and `test` targets.
+- **P2P Interfaces:** Defined the core `Peer` and `Transport` interfaces in the `p2p/` package to decouple the networking logic from the rest of the system.
+- **RPC Message Types:** Added the `RPC` struct with `IncomingMessage` and `IncomingStream` byte constants to distinguish regular messages from raw file streams.
+- **Handshake:** Added a `HandshakeFunc` type and a `NOPHandshakeFunc` placeholder — real peer authentication can be plugged in here later.
+- **Message Decoder:** Implemented a `DefaultDecoder` that reads a 1-byte type prefix to determine if incoming data is a message or a stream, without blocking the read loop.
+- **TCP Transport:** Implemented `TCPPeer` (wraps `net.Conn`, uses a `sync.WaitGroup` to pause reads during file streams) and `TCPTransport` (manages listening, dialing, and routing incoming RPCs to a buffered channel).
+- **Tests:** Added a passing test that verifies `TCPTransport` can successfully listen on a port.
+- **Entry Point:** Set up `main.go` that compiles and runs cleanly.
 
 ## Getting Started
 
