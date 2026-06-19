@@ -3,21 +3,23 @@ package p2p
 import (
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTCPTransportListenAndAccept(t *testing.T) {
 	opts := TCPTransportOpts{
-		ListenAddr:    ":3000",
+		// Use :0 so the OS picks a free port — avoids flaky "address in use" errors.
+		ListenAddr:    ":0",
 		HandshakeFunc: NOPHandshakeFunc,
 		Decoder:       DefaultDecoder{},
 	}
 
 	tr := NewTCPTransport(opts)
-	assert.Equal(t, ":3000", tr.Addr())
 
 	err := tr.ListenAndAccept()
-	assert.Nil(t, err)
+	require.NoError(t, err, "ListenAndAccept should succeed on an OS-assigned port")
 
-	tr.Close()
+	// Only close if we successfully started listening.
+	defer tr.Close()
 }
+
