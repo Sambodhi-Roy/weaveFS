@@ -31,3 +31,7 @@ bin/
 *.swp
 *.swo
 .DS_Store
+
+# CAS storage data directories (runtime-generated, never committed)
+weavefs_data/
+test_store_data/
