@@ -16,17 +16,7 @@ In the first week, we laid down the foundational boilerplate, core abstractions,
 - **Tests:** Added a passing test that verifies `TCPTransport` can successfully listen on a port.
 - **Entry Point:** Set up `main.go` that compiles and runs cleanly.
 
-## Getting Started
-
-To build and run the current state of the project, make sure you have Go installed, then run:
-
-```bash
-make run
-```
-
-*(Note for Windows users: if `make` is not available on your terminal, you can run `go run main.go` directly, or use the provided `make.bat` wrapper by running `.\make run`).*
-
-### Week 2: Content-Addressable Storage (CAS) Layer
+### Week 2-3: Content-Addressable Storage (CAS) Layer
 In the second week, we built the on-disk storage engine that every node uses to persist and retrieve files locally:
 
 - **`PathKey` & `PathTransformFunc`:** Defined a pluggable path derivation strategy. A `PathKey` holds the nested directory path and the content-hash filename derived from any string key.
@@ -41,3 +31,13 @@ In the second week, we built the on-disk storage engine that every node uses to 
 - **Node-scoped paths:** Files are stored under `<root>/<nodeID>/...` so multiple simulated nodes can coexist on the same machine without collisions.
 - **Tests:** 4 passing tests covering the CAS path transform, write/read round-trip, `Has`, and `Delete`. Temp data is cleaned up via `defer s.Clear()`.
 - **Smoke test:** `main.go` exercises a full write → read cycle, printing the stored bytes to confirm end-to-end plumbing.
+
+## Getting Started
+
+To build and run the current state of the project, make sure you have Go installed, then run:
+
+```bash
+make run
+```
+
+*(Note for Windows users: if `make` is not available on your terminal, you can run `go run main.go` directly, or use the provided `make.bat` wrapper by running `.\make run`).*
