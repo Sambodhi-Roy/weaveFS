@@ -167,3 +167,24 @@ func (s *Store) readStream(nodeID, key string) (int64, io.ReadCloser, error) {
 
 	return fi.Size(), f, nil
 }
+
+// Has reports whether a file with the given key exists in the store
+// for the specified nodeID.
+func (s *Store) Has(nodeID, key string) bool {
+	filepath := s.resolvedPath(nodeID, key)
+	_, err := os.Stat(filepath)
+	return !os.IsNotExist(err)
+}
+
+// Delete removes the entire top-level directory tree for the given key,
+// effectively deleting all path segments and the file itself.
+func (s *Store) Delete(nodeID, key string) error {
+	rootPath := s.resolvedRootPath(nodeID, key)
+	return os.RemoveAll(rootPath)
+}
+
+// Clear wipes the entire storage root directory.
+// Use this in tests or when reinitialising a node from scratch.
+func (s *Store) Clear() error {
+	return os.RemoveAll(s.Root)
+}
