@@ -4,6 +4,9 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log"
+	"os"
 	"strings"
 )
 
@@ -72,4 +75,95 @@ var DefaultPathTransformFunc PathTransformFunc = func(key string) PathKey {
 		PathName: key,
 		Filename: key,
 	}
+}
+
+// StoreOpts configures a Store instance.
+type StoreOpts struct {
+	// Root is the top-level folder that contains all node storage directories.
+	// Defaults to defaultRootFolderName if empty.
+	Root string
+	// PathTransformFunc determines how a key maps to a filesystem path.
+	// Defaults to DefaultPathTransformFunc.
+	PathTransformFunc PathTransformFunc
+}
+
+// Store manages on-disk content-addressable storage for a single node.
+type Store struct {
+	StoreOpts
+}
+
+// NewStore creates a new Store with the given options.
+func NewStore(opts StoreOpts) *Store {
+	if opts.PathTransformFunc == nil {
+		opts.PathTransformFunc = DefaultPathTransformFunc
+	}
+	if opts.Root == "" {
+		opts.Root = defaultRootFolderName
+	}
+	return &Store{StoreOpts: opts}
+}
+
+// resolvedPath returns the full OS path for a given nodeID and key.
+func (s *Store) resolvedPath(nodeID, key string) string {
+	pathKey := s.PathTransformFunc(key)
+	return fmt.Sprintf("%s/%s/%s", s.Root, nodeID, pathKey.FullPath())
+}
+
+// resolvedRootPath returns the top-level hash directory (used for deletion).
+func (s *Store) resolvedRootPath(nodeID, key string) string {
+	pathKey := s.PathTransformFunc(key)
+	return fmt.Sprintf("%s/%s/%s", s.Root, nodeID, pathKey.FirstPathName())
+}
+
+// Write streams data from r into the CAS store under the given nodeID and key.
+// Returns the number of bytes written.
+func (s *Store) Write(nodeID, key string, r io.Reader) (int64, error) {
+	return s.writeStream(nodeID, key, r)
+}
+
+func (s *Store) writeStream(nodeID, key string, r io.Reader) (int64, error) {
+	pathKey := s.PathTransformFunc(key)
+	pathWithRoot := fmt.Sprintf("%s/%s/%s", s.Root, nodeID, pathKey.PathName)
+
+	if err := os.MkdirAll(pathWithRoot, os.ModePerm); err != nil {
+		return 0, err
+	}
+
+	filepath := fmt.Sprintf("%s/%s", pathWithRoot, pathKey.Filename)
+	f, err := os.Create(filepath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	n, err := io.Copy(f, r)
+	if err != nil {
+		return 0, err
+	}
+
+	log.Printf("[store] wrote %d bytes to %s\n", n, filepath)
+	return n, nil
+}
+
+// Read opens the stored file and returns its size and a reader.
+// The caller is responsible for closing the underlying file.
+func (s *Store) Read(nodeID, key string) (int64, io.ReadCloser, error) {
+	return s.readStream(nodeID, key)
+}
+
+func (s *Store) readStream(nodeID, key string) (int64, io.ReadCloser, error) {
+	filepath := s.resolvedPath(nodeID, key)
+
+	f, err := os.Open(filepath)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return 0, nil, err
+	}
+
+	return fi.Size(), f, nil
 }
