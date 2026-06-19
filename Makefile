@@ -1,5 +1,5 @@
 build:
-	@go build -o bin/fs.exe
+	@go build -o bin/fs.exe ./cmd/weavefs
 
 run: build
 	@.\bin\fs.exe
