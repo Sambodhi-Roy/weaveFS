@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
 const defaultRootFolderName = "weavefs_data"
@@ -85,11 +87,19 @@ type StoreOpts struct {
 	// PathTransformFunc determines how a key maps to a filesystem path.
 	// Defaults to DefaultPathTransformFunc.
 	PathTransformFunc PathTransformFunc
+	// MaxVersions is the maximum number of versions to retain per key.
+	// When a new write would exceed this limit the oldest versions are
+	// automatically pruned. 0 (the default) means keep all versions.
+	MaxVersions int
 }
 
 // Store manages on-disk content-addressable storage for a single node.
 type Store struct {
 	StoreOpts
+	// mu holds one *sync.RWMutex per (nodeID+":"+key) pair.
+	// Per-key locking means concurrent writes to different keys never block
+	// each other, while concurrent writes to the same key are serialised.
+	mu sync.Map
 }
 
 // NewStore creates a new Store with the given options.
@@ -113,6 +123,15 @@ func (s *Store) resolvedPath(nodeID, key string) string {
 func (s *Store) resolvedRootPath(nodeID, key string) string {
 	pathKey := s.PathTransformFunc(key)
 	return fmt.Sprintf("%s/%s/%s", s.Root, nodeID, pathKey.FirstPathName())
+}
+
+// lockForKey returns the *sync.RWMutex associated with the given (nodeID, key)
+// pair, creating one on first use. Multiple callers for the same pair share
+// the same mutex; callers for different pairs get independent mutexes.
+func (s *Store) lockForKey(nodeID, key string) *sync.RWMutex {
+	mapKey := nodeID + ":" + key
+	actual, _ := s.mu.LoadOrStore(mapKey, &sync.RWMutex{})
+	return actual.(*sync.RWMutex)
 }
 
 // Write streams data from r into the CAS store under the given nodeID and key.
@@ -188,3 +207,7 @@ func (s *Store) Delete(nodeID, key string) error {
 func (s *Store) Clear() error {
 	return os.RemoveAll(s.Root)
 }
+
+// Ensure time is referenced so the import is not flagged unused before
+// WriteVersion is added in the next commit.
+var _ = time.Time{}
