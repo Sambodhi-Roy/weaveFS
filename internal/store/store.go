@@ -134,10 +134,13 @@ func (s *Store) lockForKey(nodeID, key string) *sync.RWMutex {
 	return actual.(*sync.RWMutex)
 }
 
-// Write streams data from r into the CAS store under the given nodeID and key.
-// Returns the number of bytes written.
+// Write saves data under key, always creating a new version. Delegates to WriteVersion.
 func (s *Store) Write(nodeID, key string, r io.Reader) (int64, error) {
-	return s.writeStream(nodeID, key, r)
+	entry, err := s.WriteVersion(nodeID, key, "", r)
+	if err != nil {
+		return 0, err
+	}
+	return entry.SizeBytes, nil
 }
 
 func (s *Store) writeStream(nodeID, key string, r io.Reader) (int64, error) {
@@ -164,10 +167,9 @@ func (s *Store) writeStream(nodeID, key string, r io.Reader) (int64, error) {
 	return n, nil
 }
 
-// Read opens the stored file and returns its size and a reader.
-// The caller is responsible for closing the underlying file.
+// Read returns the latest version's size and a ReadCloser. Delegates to ReadVersion.
 func (s *Store) Read(nodeID, key string) (int64, io.ReadCloser, error) {
-	return s.readStream(nodeID, key)
+	return s.ReadVersion(nodeID, key, "")
 }
 
 func (s *Store) readStream(nodeID, key string) (int64, io.ReadCloser, error) {
@@ -187,19 +189,36 @@ func (s *Store) readStream(nodeID, key string) (int64, io.ReadCloser, error) {
 	return fi.Size(), f, nil
 }
 
-// Has reports whether a file with the given key exists in the store
-// for the specified nodeID.
+// Has reports whether key has at least one stored version on nodeID.
 func (s *Store) Has(nodeID, key string) bool {
-	filepath := s.resolvedPath(nodeID, key)
-	_, err := os.Stat(filepath)
-	return !os.IsNotExist(err)
+	mu := s.lockForKey(nodeID, key)
+	mu.RLock()
+	defer mu.RUnlock()
+
+	idx, err := loadIndex(indexPath(s.Root, nodeID, key), key)
+	if err != nil {
+		return false
+	}
+	return idx.Latest != ""
 }
 
-// Delete removes the entire top-level directory tree for the given key,
-// effectively deleting all path segments and the file itself.
+// Delete removes ALL versions of key for nodeID, including the version index.
+// NOTE: this is permanent and removes complete history.
 func (s *Store) Delete(nodeID, key string) error {
-	rootPath := s.resolvedRootPath(nodeID, key)
-	return os.RemoveAll(rootPath)
+	mu := s.lockForKey(nodeID, key)
+	mu.Lock()
+	defer mu.Unlock()
+
+	idxFile := indexPath(s.Root, nodeID, key)
+	idx, err := loadIndex(idxFile, key)
+	if err != nil {
+		return err
+	}
+	for _, v := range idx.Versions {
+		_ = s.deleteVersionBlob(nodeID, key, v.VersionID)
+	}
+	_ = os.Remove(idxFile)
+	return nil
 }
 
 // Clear wipes the entire storage root directory.
