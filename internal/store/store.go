@@ -208,6 +208,171 @@ func (s *Store) Clear() error {
 	return os.RemoveAll(s.Root)
 }
 
-// Ensure time is referenced so the import is not flagged unused before
-// WriteVersion is added in the next commit.
-var _ = time.Time{}
+// WriteVersion saves a new immutable version blob for key and updates the version index.
+func (s *Store) WriteVersion(nodeID, key, message string, r io.Reader) (VersionEntry, error) {
+	mu := s.lockForKey(nodeID, key)
+	mu.Lock()
+	defer mu.Unlock()
+
+	idxFile := indexPath(s.Root, nodeID, key)
+	idx, err := loadIndex(idxFile, key)
+	if err != nil {
+		return VersionEntry{}, err
+	}
+
+	versionID := newUUID()
+	seq := nextSeq(idx)
+
+	// Write the blob using the existing low-level writer.
+	// The CAS path is derived from key@versionID so every version is unique.
+	n, err := s.writeStream(nodeID, versionedKey(key, versionID), r)
+	if err != nil {
+		return VersionEntry{}, err
+	}
+
+	entry := VersionEntry{
+		VersionID: versionID,
+		Seq:       seq,
+		CreatedAt: time.Now().UTC(),
+		SizeBytes: n,
+		Message:   message,
+	}
+
+	idx.Versions = append(idx.Versions, entry)
+	idx.Latest = versionID
+
+	// Prune oldest versions if MaxVersions is configured.
+	if s.MaxVersions > 0 && len(idx.Versions) > s.MaxVersions {
+		toRemove := idx.Versions[:len(idx.Versions)-s.MaxVersions]
+		for _, old := range toRemove {
+			_ = s.deleteVersionBlob(nodeID, key, old.VersionID)
+		}
+		idx.Versions = idx.Versions[len(idx.Versions)-s.MaxVersions:]
+	}
+
+	if err := saveIndex(idxFile, idx); err != nil {
+		return VersionEntry{}, err
+	}
+
+	log.Printf("[store] wrote version %s (seq=%d) for key %q on node %s\n",
+		versionID, seq, key, nodeID)
+	return entry, nil
+}
+
+// ReadVersion returns a specific version blob; pass empty string for the latest.
+func (s *Store) ReadVersion(nodeID, key, versionID string) (int64, io.ReadCloser, error) {
+	mu := s.lockForKey(nodeID, key)
+	mu.RLock()
+	defer mu.RUnlock()
+
+	idxFile := indexPath(s.Root, nodeID, key)
+	idx, err := loadIndex(idxFile, key)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	if versionID == "" {
+		// Caller wants the latest version.
+		if idx.Latest == "" {
+			return 0, nil, fmt.Errorf("store: no versions found for key %q on node %s", key, nodeID)
+		}
+		versionID = idx.Latest
+	} else {
+		// Verify the requested version exists in the index.
+		found := false
+		for _, v := range idx.Versions {
+			if v.VersionID == versionID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return 0, nil, fmt.Errorf("store: version %q not found for key %q on node %s",
+				versionID, key, nodeID)
+		}
+	}
+
+	return s.readStream(nodeID, versionedKey(key, versionID))
+}
+
+// ListVersions returns a copy of the ordered version history for key, oldest first.
+func (s *Store) ListVersions(nodeID, key string) ([]VersionEntry, error) {
+	mu := s.lockForKey(nodeID, key)
+	mu.RLock()
+	defer mu.RUnlock()
+
+	idxFile := indexPath(s.Root, nodeID, key)
+	idx, err := loadIndex(idxFile, key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return a defensive copy so callers cannot mutate the live index slice.
+	out := make([]VersionEntry, len(idx.Versions))
+	copy(out, idx.Versions)
+	return out, nil
+}
+
+// deleteVersionBlob removes a single version blob from disk; callers must hold the write lock.
+func (s *Store) deleteVersionBlob(nodeID, key, versionID string) error {
+	rootPath := s.resolvedRootPath(nodeID, versionedKey(key, versionID))
+	return os.RemoveAll(rootPath)
+}
+
+// DeleteVersion removes one version blob and prunes it from the index. Rewinds Latest if needed.
+func (s *Store) DeleteVersion(nodeID, key, versionID string) error {
+	mu := s.lockForKey(nodeID, key)
+	mu.Lock()
+	defer mu.Unlock()
+
+	idxFile := indexPath(s.Root, nodeID, key)
+	idx, err := loadIndex(idxFile, key)
+	if err != nil {
+		return err
+	}
+
+	// Find the version and rebuild the slice without it.
+	found := false
+	filtered := idx.Versions[:0]
+	for _, v := range idx.Versions {
+		if v.VersionID == versionID {
+			found = true
+			continue // skip — this is the one being deleted
+		}
+		filtered = append(filtered, v)
+	}
+	if !found {
+		return fmt.Errorf("store: version %q not found for key %q on node %s",
+			versionID, key, nodeID)
+	}
+	idx.Versions = filtered
+
+	// Rewind Latest if we just removed it.
+	if idx.Latest == versionID {
+		if len(idx.Versions) > 0 {
+			idx.Latest = idx.Versions[len(idx.Versions)-1].VersionID
+		} else {
+			idx.Latest = ""
+		}
+	}
+
+	// Remove the blob from disk before saving the updated index.
+	if err := s.deleteVersionBlob(nodeID, key, versionID); err != nil {
+		return err
+	}
+	return saveIndex(idxFile, idx)
+}
+
+// RollbackTo re-writes an old version as a new entry, making it the latest while preserving history.
+func (s *Store) RollbackTo(nodeID, key, versionID string) (VersionEntry, error) {
+	// Read the target version's content (acquires and releases the read lock).
+	_, rc, err := s.ReadVersion(nodeID, key, versionID)
+	if err != nil {
+		return VersionEntry{}, fmt.Errorf("store: RollbackTo: cannot read version %q: %w", versionID, err)
+	}
+	defer rc.Close()
+
+	// Write it as a new version (acquires the write lock independently).
+	msg := fmt.Sprintf("rollback to version %s", versionID)
+	return s.WriteVersion(nodeID, key, msg, rc)
+}
