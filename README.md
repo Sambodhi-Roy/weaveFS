@@ -29,8 +29,6 @@ In the second week, we built the on-disk storage engine that every node uses to 
   - `Delete(nodeID, key)` — removes the entire top-level hash directory tree for a key.
   - `Clear()` — wipes the entire root (used in tests).
 - **Node-scoped paths:** Files are stored under `<root>/<nodeID>/...` so multiple simulated nodes can coexist on the same machine without collisions.
-- **Tests:** 4 passing tests covering the CAS path transform, write/read round-trip, `Has`, and `Delete`. Temp data is cleaned up via `defer s.Clear()`.
-- **Smoke test:** `main.go` exercises a full write → read cycle, printing the stored bytes to confirm end-to-end plumbing.
 
 ## Getting Started
 
