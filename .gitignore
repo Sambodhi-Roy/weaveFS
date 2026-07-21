@@ -35,3 +35,8 @@ bin/
 # CAS storage data directories (runtime-generated, never committed)
 weavefs_data/
 test_store_data/
+
+# Node identity keys. These are real private keys, a node's network identity
+# is derived from them. Already covered by weavefs_data/, but listed explicitly
+# so a custom data directory cannot leak one.
+*.key
