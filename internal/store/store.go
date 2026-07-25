@@ -170,20 +170,33 @@ func (s *Store) Write(nodeID, key string, r io.Reader) (int64, error) {
 	return entry.SizeBytes, nil
 }
 
+// createBlobFile creates the directory tree for a blob and opens the file for
+// writing, returning the handle and the path it was created at.
+//
+// It is shared by the encrypting and the verbatim write paths, which differ
+// only in what they wrap around the returned file.
+func (s *Store) createBlobFile(nodeID, key string) (*os.File, string, error) {
+	pathKey := s.PathTransformFunc(key)
+	pathWithRoot := fmt.Sprintf("%s/%s/%s", s.Root, nodeID, pathKey.PathName)
+
+	if err := os.MkdirAll(pathWithRoot, os.ModePerm); err != nil {
+		return nil, "", err
+	}
+
+	filepath := fmt.Sprintf("%s/%s", pathWithRoot, pathKey.Filename)
+	f, err := os.Create(filepath)
+	if err != nil {
+		return nil, "", err
+	}
+	return f, filepath, nil
+}
+
 // writeStream copies r to the blob's CAS path, encrypting on the way if a
 // Cipher is configured. The returned count is always plaintext bytes: it comes
 // from io.Copy, which reports what it read from r, and the cipher's header is
 // written before the copy begins so it never passes through that count.
 func (s *Store) writeStream(nodeID, key string, r io.Reader) (int64, error) {
-	pathKey := s.PathTransformFunc(key)
-	pathWithRoot := fmt.Sprintf("%s/%s/%s", s.Root, nodeID, pathKey.PathName)
-
-	if err := os.MkdirAll(pathWithRoot, os.ModePerm); err != nil {
-		return 0, err
-	}
-
-	filepath := fmt.Sprintf("%s/%s", pathWithRoot, pathKey.Filename)
-	f, err := os.Create(filepath)
+	f, filepath, err := s.createBlobFile(nodeID, key)
 	if err != nil {
 		return 0, err
 	}
@@ -322,14 +335,7 @@ func (s *Store) WriteVersion(nodeID, key, message string, r io.Reader) (VersionE
 	idx.Versions = append(idx.Versions, entry)
 	idx.Latest = versionID
 
-	// Prune oldest versions if MaxVersions is configured.
-	if s.MaxVersions > 0 && len(idx.Versions) > s.MaxVersions {
-		toRemove := idx.Versions[:len(idx.Versions)-s.MaxVersions]
-		for _, old := range toRemove {
-			_ = s.deleteVersionBlob(nodeID, key, old.VersionID)
-		}
-		idx.Versions = idx.Versions[len(idx.Versions)-s.MaxVersions:]
-	}
+	s.pruneOldestVersions(nodeID, key, idx)
 
 	if err := saveIndex(idxFile, idx); err != nil {
 		return VersionEntry{}, err
@@ -338,6 +344,42 @@ func (s *Store) WriteVersion(nodeID, key, message string, r io.Reader) (VersionE
 	log.Printf("[store] wrote version %s (seq=%d) for key %q on node %s\n",
 		versionID, seq, key, nodeID)
 	return entry, nil
+}
+
+// pruneOldestVersions trims the index to MaxVersions entries, deleting the
+// blobs it drops. It does nothing when MaxVersions is 0, the default, which
+// means keep everything. Callers must hold the write lock.
+func (s *Store) pruneOldestVersions(nodeID, key string, idx *VersionIndex) {
+	if s.MaxVersions <= 0 || len(idx.Versions) <= s.MaxVersions {
+		return
+	}
+
+	cut := len(idx.Versions) - s.MaxVersions
+	for _, old := range idx.Versions[:cut] {
+		_ = s.deleteVersionBlob(nodeID, key, old.VersionID)
+	}
+	idx.Versions = idx.Versions[cut:]
+}
+
+// resolveVersion finds the entry for versionID, treating an empty versionID as
+// a request for the latest. It both verifies the version exists and supplies
+// its recorded metadata.
+func resolveVersion(idx *VersionIndex, nodeID, key, versionID string) (VersionEntry, error) {
+	if versionID == "" {
+		if idx.Latest == "" {
+			return VersionEntry{}, fmt.Errorf(
+				"store: no versions found for key %q on node %s", key, nodeID)
+		}
+		versionID = idx.Latest
+	}
+
+	for _, v := range idx.Versions {
+		if v.VersionID == versionID {
+			return v, nil
+		}
+	}
+	return VersionEntry{}, fmt.Errorf("store: version %q not found for key %q on node %s",
+		versionID, key, nodeID)
 }
 
 // ReadVersion returns a specific version blob; pass empty string for the latest.
@@ -350,37 +392,17 @@ func (s *Store) ReadVersion(nodeID, key, versionID string) (int64, io.ReadCloser
 	mu.RLock()
 	defer mu.RUnlock()
 
-	idxFile := indexPath(s.Root, nodeID, key)
-	idx, err := loadIndex(idxFile, key)
+	idx, err := loadIndex(indexPath(s.Root, nodeID, key), key)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	if versionID == "" {
-		// Caller wants the latest version.
-		if idx.Latest == "" {
-			return 0, nil, fmt.Errorf("store: no versions found for key %q on node %s", key, nodeID)
-		}
-		versionID = idx.Latest
+	entry, err := resolveVersion(idx, nodeID, key, versionID)
+	if err != nil {
+		return 0, nil, err
 	}
 
-	// Locate the entry, which both verifies the version exists and supplies its
-	// plaintext size.
-	var entry VersionEntry
-	found := false
-	for _, v := range idx.Versions {
-		if v.VersionID == versionID {
-			entry = v
-			found = true
-			break
-		}
-	}
-	if !found {
-		return 0, nil, fmt.Errorf("store: version %q not found for key %q on node %s",
-			versionID, key, nodeID)
-	}
-
-	rc, err := s.readStream(nodeID, versionedKey(key, versionID))
+	rc, err := s.readStream(nodeID, versionedKey(key, entry.VersionID))
 	if err != nil {
 		return 0, nil, err
 	}
