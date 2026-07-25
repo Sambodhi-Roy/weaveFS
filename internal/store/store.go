@@ -42,6 +42,29 @@ func (p PathKey) FullPath() string {
 // from an arbitrary string key.
 type PathTransformFunc func(key string) PathKey
 
+// Cipher transforms blob content as it streams to and from disk.
+//
+// The interface is declared here, in the package that consumes it, rather than
+// alongside its implementation in internal/crypto. That is the Go convention,
+// and it means the dependency points one way: store never imports crypto, and
+// tests can substitute a fake without pulling real cryptography in.
+//
+// A nil Cipher means blobs are stored as plaintext, which is the zero value and
+// therefore the default.
+type Cipher interface {
+	// EncryptWriter returns a writer that encrypts everything written to it
+	// into w, having first written any header of its own to w.
+	EncryptWriter(w io.Writer) (io.Writer, error)
+
+	// DecryptReader returns a reader yielding plaintext from the ciphertext in
+	// r, having first consumed and validated any header.
+	DecryptReader(r io.Reader) (io.Reader, error)
+
+	// Overhead reports how many bytes larger a stored blob is than its
+	// plaintext.
+	Overhead() int64
+}
+
 // CASPathTransformFunc implements content-addressable storage path derivation.
 // It SHA-1 hashes the key, then splits the 40-char hex string into 8 chunks
 // of 5 characters each to form a nested directory tree.
@@ -91,6 +114,10 @@ type StoreOpts struct {
 	// When a new write would exceed this limit the oldest versions are
 	// automatically pruned. 0 (the default) means keep all versions.
 	MaxVersions int
+	// Cipher encrypts blob content at rest. nil (the default) stores
+	// plaintext. Note that a Store cannot read blobs written under a
+	// different setting: switching this on or off orphans existing data.
+	Cipher Cipher
 }
 
 // Store manages on-disk content-addressable storage for a single node.
@@ -143,6 +170,10 @@ func (s *Store) Write(nodeID, key string, r io.Reader) (int64, error) {
 	return entry.SizeBytes, nil
 }
 
+// writeStream copies r to the blob's CAS path, encrypting on the way if a
+// Cipher is configured. The returned count is always plaintext bytes: it comes
+// from io.Copy, which reports what it read from r, and the cipher's header is
+// written before the copy begins so it never passes through that count.
 func (s *Store) writeStream(nodeID, key string, r io.Reader) (int64, error) {
 	pathKey := s.PathTransformFunc(key)
 	pathWithRoot := fmt.Sprintf("%s/%s/%s", s.Root, nodeID, pathKey.PathName)
@@ -158,7 +189,17 @@ func (s *Store) writeStream(nodeID, key string, r io.Reader) (int64, error) {
 	}
 	defer f.Close()
 
-	n, err := io.Copy(f, r)
+	// dst is the file itself when storing plaintext, or a decorator wrapping it
+	// when encrypting. io.Copy cannot tell the difference — both are io.Writer.
+	var dst io.Writer = f
+	if s.Cipher != nil {
+		dst, err = s.Cipher.EncryptWriter(f)
+		if err != nil {
+			return 0, fmt.Errorf("store: writeStream: %w", err)
+		}
+	}
+
+	n, err := io.Copy(dst, r)
 	if err != nil {
 		return 0, err
 	}
@@ -172,21 +213,42 @@ func (s *Store) Read(nodeID, key string) (int64, io.ReadCloser, error) {
 	return s.ReadVersion(nodeID, key, "")
 }
 
-func (s *Store) readStream(nodeID, key string) (int64, io.ReadCloser, error) {
+// decryptedFile pairs a decrypting reader with the file underneath it, so that
+// closing the value the caller was handed still closes the real file descriptor.
+// The embedded io.Reader supplies Read; only Close needs writing.
+type decryptedFile struct {
+	io.Reader
+	f *os.File
+}
+
+// Close releases the underlying file. The decrypting reader itself holds no
+// resources — CTR keeps only a counter — so there is nothing else to release.
+func (d *decryptedFile) Close() error { return d.f.Close() }
+
+// readStream opens a blob, decrypting it if a Cipher is configured.
+//
+// It deliberately does not report a size. The file on disk is larger than its
+// plaintext once encrypted, and the authoritative plaintext length already
+// lives in the version index, so ReadVersion supplies it from there instead of
+// this function re-deriving it with a stat and some arithmetic.
+func (s *Store) readStream(nodeID, key string) (io.ReadCloser, error) {
 	filepath := s.resolvedPath(nodeID, key)
 
 	f, err := os.Open(filepath)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 
-	fi, err := f.Stat()
+	if s.Cipher == nil {
+		return f, nil
+	}
+
+	plaintext, err := s.Cipher.DecryptReader(f)
 	if err != nil {
 		f.Close()
-		return 0, nil, err
+		return nil, fmt.Errorf("store: readStream: %s: %w", filepath, err)
 	}
-
-	return fi.Size(), f, nil
+	return &decryptedFile{Reader: plaintext, f: f}, nil
 }
 
 // Has reports whether key has at least one stored version on nodeID.
@@ -279,6 +341,10 @@ func (s *Store) WriteVersion(nodeID, key, message string, r io.Reader) (VersionE
 }
 
 // ReadVersion returns a specific version blob; pass empty string for the latest.
+//
+// The size returned is the plaintext length, taken from the version index
+// rather than from the file on disk — those differ once encryption is enabled,
+// and the index is the authoritative record of what was written.
 func (s *Store) ReadVersion(nodeID, key, versionID string) (int64, io.ReadCloser, error) {
 	mu := s.lockForKey(nodeID, key)
 	mu.RLock()
@@ -296,22 +362,29 @@ func (s *Store) ReadVersion(nodeID, key, versionID string) (int64, io.ReadCloser
 			return 0, nil, fmt.Errorf("store: no versions found for key %q on node %s", key, nodeID)
 		}
 		versionID = idx.Latest
-	} else {
-		// Verify the requested version exists in the index.
-		found := false
-		for _, v := range idx.Versions {
-			if v.VersionID == versionID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return 0, nil, fmt.Errorf("store: version %q not found for key %q on node %s",
-				versionID, key, nodeID)
-		}
 	}
 
-	return s.readStream(nodeID, versionedKey(key, versionID))
+	// Locate the entry, which both verifies the version exists and supplies its
+	// plaintext size.
+	var entry VersionEntry
+	found := false
+	for _, v := range idx.Versions {
+		if v.VersionID == versionID {
+			entry = v
+			found = true
+			break
+		}
+	}
+	if !found {
+		return 0, nil, fmt.Errorf("store: version %q not found for key %q on node %s",
+			versionID, key, nodeID)
+	}
+
+	rc, err := s.readStream(nodeID, versionedKey(key, versionID))
+	if err != nil {
+		return 0, nil, err
+	}
+	return entry.SizeBytes, rc, nil
 }
 
 // ListVersions returns a copy of the ordered version history for key, oldest first.
