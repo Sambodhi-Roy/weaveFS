@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
+
+	"github.com/Sambodhi-Roy/weaveFS/internal/fsutil"
 )
 
 // identityFileName is the file, relative to the node's data directory, that
@@ -60,29 +62,8 @@ func createIdentity(path string) (crypto.PrivKey, error) {
 		return nil, fmt.Errorf("node: marshalling identity: %w", err)
 	}
 
-	if err := writeFileAtomic(path, data, identityFileMode); err != nil {
+	if err := fsutil.WriteFileAtomic(path, data, identityFileMode); err != nil {
 		return nil, fmt.Errorf("node: saving identity %s: %w", path, err)
 	}
 	return priv, nil
-}
-
-// writeFileAtomic writes data to path via a temporary file and a rename, so a
-// crash mid-write cannot leave a truncated file in place. This mirrors the
-// approach internal/store uses for its version index.
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
-		return err
-	}
-
-	// The temporary file is a sibling so the rename stays on one filesystem.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
-		return err
-	}
-
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp) // best-effort cleanup
-		return err
-	}
-	return nil
 }
