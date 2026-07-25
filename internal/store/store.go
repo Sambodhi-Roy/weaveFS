@@ -427,6 +427,26 @@ func (s *Store) ListVersions(nodeID, key string) ([]VersionEntry, error) {
 	return out, nil
 }
 
+// VersionInfo returns the recorded metadata for one version without opening the
+// blob. Pass an empty versionID for the latest.
+//
+// It exists so callers that need to describe a version — to a peer, or to a
+// user — resolve it by the same rule the read paths use. Picking the last entry
+// from ListVersions is very nearly right and quietly wrong: the newest entry is
+// normally last, but a version re-stored in place keeps its original position
+// while still becoming the latest.
+func (s *Store) VersionInfo(nodeID, key, versionID string) (VersionEntry, error) {
+	mu := s.lockForKey(nodeID, key)
+	mu.RLock()
+	defer mu.RUnlock()
+
+	idx, err := loadIndex(indexPath(s.Root, nodeID, key), key)
+	if err != nil {
+		return VersionEntry{}, err
+	}
+	return resolveVersion(idx, nodeID, key, versionID)
+}
+
 // deleteVersionBlob removes a single version blob from disk; callers must hold the write lock.
 func (s *Store) deleteVersionBlob(nodeID, key, versionID string) error {
 	rootPath := s.resolvedRootPath(nodeID, versionedKey(key, versionID))
