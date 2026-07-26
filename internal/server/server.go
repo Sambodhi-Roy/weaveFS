@@ -74,6 +74,37 @@ type Config struct {
 	Authorizer Authorizer
 }
 
+// WriteResult reports what a write actually achieved: the version that was
+// created on local disk, and how that version fared on the network.
+//
+// The two halves are independent and must be read separately. A write that
+// returns a nil error always produced Entry — the local copy is on disk. It may
+// still have reached nobody, in which case PeersStored is zero. A caller that
+// wants to tell a user their file is safely distributed has to look here; the
+// error alone will not say so.
+type WriteResult struct {
+	// Entry is the version that was written locally.
+	Entry store.VersionEntry
+
+	// PeersTried is how many peers were selected to receive a copy. Zero means
+	// no peers were connected, not that replication failed.
+	PeersTried int
+
+	// PeersStored is how many of them confirmed they wrote it.
+	PeersStored int
+
+	// Failures names every peer that did not take a copy, and why. Its length
+	// is always PeersTried minus PeersStored.
+	Failures []ReplicaFailure
+}
+
+// ReplicaFailure names one peer that did not take a copy, and the reason it
+// gave or the error that stopped it.
+type ReplicaFailure struct {
+	Peer peer.ID
+	Err  error
+}
+
 // FileServer answers requests from peers and makes them on this node's behalf.
 type FileServer struct {
 	cfg Config
@@ -145,50 +176,77 @@ func (s *FileServer) Close() error {
 
 // Store writes a file to local disk and replicates it to peers.
 //
-// The local write is what determines success. Replication is best effort: a
-// peer that is unreachable or refuses is logged and the call still returns the
-// version that was written. Failing a user's write because some third party was
+// The returned error is about the local write only. If it is nil the file is on
+// this node's disk, full stop. What happened on the network is in the
+// WriteResult, and the caller is expected to look: replication is best effort,
+// so a peer that is unreachable or refuses is recorded there rather than
+// failing the call. Failing a user's write because some third party was
 // unreachable would be a worse default, and doing better needs acknowledged
 // replication that weaveFS does not have yet.
-func (s *FileServer) Store(ctx context.Context, key string, r io.Reader) (store.VersionEntry, error) {
+//
+// The earlier version of this method discarded the replication outcome
+// entirely, which made a write to two peers and a write to nobody
+// indistinguishable to the caller. See
+// improvements -for-future/10-replication-has-no-acknowledgement-or-repair.md.
+func (s *FileServer) Store(ctx context.Context, key string, r io.Reader) (WriteResult, error) {
 	return s.StoreVersion(ctx, key, "", r)
 }
 
 // StoreVersion is Store with a message attached to the version, the way a
 // commit message is attached to a commit.
-func (s *FileServer) StoreVersion(ctx context.Context, key, message string, r io.Reader) (store.VersionEntry, error) {
+func (s *FileServer) StoreVersion(ctx context.Context, key, message string, r io.Reader) (WriteResult, error) {
 	entry, err := s.cfg.Store.WriteVersion(s.nodeID, key, message, r)
 	if err != nil {
-		return store.VersionEntry{}, fmt.Errorf("server: Store %q: local write: %w", key, err)
+		return WriteResult{}, fmt.Errorf("server: Store %q: local write: %w", key, err)
 	}
 
-	s.replicate(ctx, key, entry)
-	return entry, nil
+	result := s.replicate(ctx, key, entry)
+	result.Entry = entry
+	return result, nil
 }
 
 // replicate sends one version to every selected peer, concurrently, and waits
 // for them all to finish or fail.
-func (s *FileServer) replicate(ctx context.Context, key string, entry store.VersionEntry) {
+//
+// It fills in every field of the returned WriteResult except Entry, which
+// belongs to the caller that did the local write.
+func (s *FileServer) replicate(ctx context.Context, key string, entry store.VersionEntry) WriteResult {
 	peers := s.selectPeers()
 	if len(peers) == 0 {
 		log.Printf("[server] no peers connected, so %q exists only on this node", key)
-		return
+		return WriteResult{}
 	}
 
+	// Each goroutine writes to its own slot, so no lock is needed: the slice is
+	// never resized and no two goroutines touch the same element. A nil slot
+	// means that peer succeeded.
+	errs := make([]error, len(peers))
+
 	var wg sync.WaitGroup
-	for _, p := range peers {
+	for i, p := range peers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
 			if err := s.sendBlob(ctx, p, key, entry); err != nil {
 				log.Printf("[server] replicating %q to %s failed: %v", key, p, err)
+				errs[i] = err
 				return
 			}
 			log.Printf("[server] replicated %q to %s", key, p)
 		}()
 	}
 	wg.Wait()
+
+	result := WriteResult{PeersTried: len(peers)}
+	for i, err := range errs {
+		if err == nil {
+			result.PeersStored++
+			continue
+		}
+		result.Failures = append(result.Failures, ReplicaFailure{Peer: peers[i], Err: err})
+	}
+	return result
 }
 
 // selectPeers returns the peers that should receive a copy.
@@ -266,8 +324,21 @@ func (s *FileServer) sendBlob(ctx context.Context, to peer.ID, key string, entry
 // transfers exactly one copy — the reference implementation broadcasts and then
 // reads a full copy from every peer, each overwriting the last on disk.
 func (s *FileServer) Get(ctx context.Context, key string) (int64, io.ReadCloser, error) {
+	return s.GetVersion(ctx, key, "")
+}
+
+// GetVersion is Get for one particular version. An empty versionID means the
+// latest, which is what Get passes.
+func (s *FileServer) GetVersion(ctx context.Context, key, versionID string) (int64, io.ReadCloser, error) {
 	if s.cfg.Store.Has(s.nodeID, key) {
-		return s.cfg.Store.Read(s.nodeID, key)
+		// Has only reports that the key exists at all. Asking for a version
+		// this node never had still has to fall through to the peers below,
+		// which is why the read error is not returned immediately.
+		size, rc, err := s.cfg.Store.ReadVersion(s.nodeID, key, versionID)
+		if err == nil {
+			return size, rc, nil
+		}
+		log.Printf("[server] %q is here but version %q is not: %v", key, versionID, err)
 	}
 
 	peers := s.cfg.Node.Peers()
@@ -277,17 +348,34 @@ func (s *FileServer) Get(ctx context.Context, key string) (int64, io.ReadCloser,
 	}
 
 	for _, p := range peers {
-		if err := s.fetchBlob(ctx, p, key); err != nil {
+		if err := s.fetchBlob(ctx, p, key, versionID); err != nil {
 			log.Printf("[server] %s could not supply %q: %v", p, key, err)
 			continue
 		}
 
 		log.Printf("[server] recovered %q from %s", key, p)
-		return s.cfg.Store.Read(s.nodeID, key)
+		return s.cfg.Store.ReadVersion(s.nodeID, key, versionID)
 	}
 
 	return 0, nil, fmt.Errorf("server: Get %q: none of the %d connected peers hold it",
 		key, len(peers))
+}
+
+// Delete removes every version of one of this node's own keys from local disk.
+//
+// It is local only. Custodians keep the copies they were given, and nothing
+// tells them to drop them — distributed deletion needs tombstones weaveFS does
+// not have. See improvements -for-future/07-no-standalone-prune.md. That is
+// exactly what makes Delete useful for demonstrating recovery: the local copy
+// goes, the replica stays, and Get has somewhere to fetch from.
+func (s *FileServer) Delete(key string) error {
+	return s.cfg.Store.Delete(s.nodeID, key)
+}
+
+// Has reports whether this node holds the key on its own disk, without asking
+// any peer.
+func (s *FileServer) Has(key string) bool {
+	return s.cfg.Store.Has(s.nodeID, key)
 }
 
 // fetchBlob asks one peer for a blob and, if it has it, stores the returned
@@ -296,7 +384,7 @@ func (s *FileServer) Get(ctx context.Context, key string) (int64, io.ReadCloser,
 // Writing them raw is what makes this work. They are this node's own
 // ciphertext, so once they are back on disk the ordinary decrypting read path
 // can open them as if they had never left.
-func (s *FileServer) fetchBlob(ctx context.Context, from peer.ID, key string) error {
+func (s *FileServer) fetchBlob(ctx context.Context, from peer.ID, key, versionID string) error {
 	stream, err := s.cfg.Node.Host().NewStream(ctx, from, proto.GetProtocol)
 	if err != nil {
 		return fmt.Errorf("opening stream: %w", err)
@@ -307,7 +395,7 @@ func (s *FileServer) fetchBlob(ctx context.Context, from peer.ID, key string) er
 		return fmt.Errorf("setting deadline: %w", err)
 	}
 
-	req := proto.GetRequest{OriginID: s.nodeID, Key: key}
+	req := proto.GetRequest{OriginID: s.nodeID, Key: key, VersionID: versionID}
 	if err := proto.WriteMessage(stream, req); err != nil {
 		_ = stream.Reset()
 		return err
