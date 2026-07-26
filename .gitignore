@@ -36,5 +36,12 @@ bin/
 weavefs_data*/
 test_store_data*/
 
-# Node identity keys. 
+# Node identity keys.
 *.key
+
+# Where a running node publishes its client API port, for put/get/ls/rm to find.
+# Runtime state, valid only while that process lives.
+api.addr
+
+# Node directories used by the end-to-end walkthrough in the README.
+node_*/
