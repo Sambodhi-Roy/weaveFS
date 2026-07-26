@@ -1,15 +1,32 @@
-// Command weavefs runs a weaveFS node.
+// Command weavefs runs a weaveFS node and talks to one that is already running.
 //
-// Three subcommands:
+// The subcommands fall into two groups.
+//
+// These start a node:
 //
 //	weavefs demo              two nodes in one process, proving a full round trip
 //	weavefs serve  -data DIR  run a node until interrupted
 //	weavefs id     -data DIR  print this node's identity and addresses
 //
-// There is deliberately no "put" or "get". Those would have to reach an
-// already-running serve process, which needs an IPC or HTTP layer weaveFS does
-// not have yet. A put that quietly started its own throwaway node, replicated
-// to nobody and exited would look like a working feature while being a lie.
+// These talk to a node that "serve" is already running:
+//
+//	weavefs put -data DIR <key> <file>     store a file
+//	weavefs get -data DIR <key> [outfile]  fetch a file
+//	weavefs ls  -data DIR <key>            list a key's versions
+//	weavefs rm  -data DIR <key>            drop a key's local copies
+//
+// The second group does not start a node of its own, and that distinction is
+// the reason those commands took so long to arrive. A "put" that quietly
+// started a throwaway node against the same data directory would be a second
+// process holding the same identity.key and blob tree, with no peer
+// connections, since discovery takes longer than such a process lives. It would
+// print "wrote 47 bytes" having replicated to nobody.
+//
+// So "serve" opens a small HTTP API on 127.0.0.1 and writes the port it got to
+// <DataDir>/api.addr. The client commands read that file and connect, which
+// means the node doing the work is the real one, with its real peers. The
+// listener is loopback-only because weaveFS has no access-control policy yet;
+// see internal/api for the full reasoning.
 package main
 
 import (
@@ -31,6 +48,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 
+	"github.com/Sambodhi-Roy/weaveFS/internal/api"
 	"github.com/Sambodhi-Roy/weaveFS/internal/crypto"
 	"github.com/Sambodhi-Roy/weaveFS/internal/node"
 	"github.com/Sambodhi-Roy/weaveFS/internal/server"
@@ -55,6 +73,14 @@ func main() {
 		err = runServe(os.Args[2:])
 	case "id":
 		err = runID(os.Args[2:])
+	case "put":
+		err = runPut(os.Args[2:])
+	case "get":
+		err = runGet(os.Args[2:])
+	case "ls":
+		err = runList(os.Args[2:])
+	case "rm":
+		err = runRemove(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -71,16 +97,35 @@ func main() {
 func usage() {
 	fmt.Print(`weaveFS — a distributed file system
 
-Usage:
+Running a node:
   weavefs demo                     run two nodes in one process and prove a round trip
   weavefs serve -data DIR          run a node until interrupted
   weavefs id    -data DIR          print this node's PeerID and addresses
+
+Using a node that "serve" is already running:
+  weavefs put -data DIR KEY FILE   store a file, and report where it went
+  weavefs get -data DIR KEY [OUT]  fetch a file (stdout if OUT is omitted)
+  weavefs ls  -data DIR KEY        list every version of a key
+  weavefs rm  -data DIR KEY        delete a key's local copies
 
 Flags for serve:
   -data DIR        node directory, holding identity.key, encryption.key and blobs
   -listen ADDR     multiaddr to listen on (default /ip4/0.0.0.0/tcp/0)
   -peer ADDR       a peer to dial on startup; may be repeated
+  -api ADDR        address for the local client API (default 127.0.0.1:0)
   -no-mdns         disable local-network discovery
+
+Flags for the client commands:
+  -data DIR        the directory of the running node to talk to
+  -m MESSAGE       (put) a note describing this version, like a commit message
+  -version ID      (get) fetch one specific version instead of the latest
+
+Getting started — three terminals:
+  1  weavefs serve -data node_a
+  2  weavefs serve -data node_b -peer <the multiaddr terminal 1 printed>
+  3  weavefs put -data node_a report ./notes.txt
+     weavefs rm  -data node_a report
+     weavefs get -data node_a report recovered.txt
 `)
 }
 
@@ -199,12 +244,16 @@ func runDemo() error {
 	fmt.Printf("  A is %s\n  B is %s\n", a.server.ID(), b.server.ID())
 
 	step(2, "node A stores a file, and replicates it to every connected peer")
-	entry, err := a.server.StoreVersion(ctx, demoKey, "first draft", bytes.NewReader(demoPayload))
+	result, err := a.server.StoreVersion(ctx, demoKey, "first draft", bytes.NewReader(demoPayload))
 	if err != nil {
 		return fmt.Errorf("storing on A: %w", err)
 	}
 	fmt.Printf("  wrote %d bytes as version %s (seq %d)\n",
-		entry.SizeBytes, entry.VersionID, entry.Seq)
+		result.Entry.SizeBytes, result.Entry.VersionID, result.Entry.Seq)
+	fmt.Printf("  replicated to %d of %d peer(s)\n", result.PeersStored, result.PeersTried)
+	for _, f := range result.Failures {
+		fmt.Printf("  %s did not take a copy: %v\n", f.Peer, f.Err)
+	}
 
 	step(3, "what node B now holds")
 	if !b.store.Has(a.server.ID(), demoKey) {
@@ -340,6 +389,7 @@ func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", "weavefs_data", "node directory")
 	listen := fs.String("listen", "/ip4/0.0.0.0/tcp/0", "multiaddr to listen on")
+	apiAddr := fs.String("api", api.DefaultAddr, "address for the local client API")
 	noMDNS := fs.Bool("no-mdns", false, "disable local-network discovery")
 
 	var peers repeatedFlag
@@ -360,6 +410,22 @@ func runServe(args []string) error {
 	}
 	defer w.close()
 
+	// The client API is what makes put, get, ls and rm possible: it is the only
+	// way another process can reach this node. Started after the node so that a
+	// port is never published for something that failed to come up.
+	clientAPI, err := api.New(api.Config{
+		FileServer: w.server,
+		DataDir:    *dataDir,
+		Addr:       *apiAddr,
+	})
+	if err != nil {
+		return err
+	}
+	if err := clientAPI.Start(); err != nil {
+		return err
+	}
+	defer clientAPI.Close()
+
 	for _, addr := range peers {
 		if err := dialPeer(ctx, w, addr); err != nil {
 			log.Printf("[main] could not dial %s: %v", addr, err)
@@ -376,6 +442,12 @@ func runServe(args []string) error {
 	for _, addr := range w.node.Addrs() {
 		fmt.Printf("  %s\n", addr)
 	}
+
+	fmt.Printf("\nclient API: http://%s\n", clientAPI.Addr())
+	fmt.Printf("from another terminal:\n")
+	fmt.Printf("  weavefs put -data %s <key> <file>\n", *dataDir)
+	fmt.Printf("  weavefs get -data %s <key> [outfile]\n", *dataDir)
+
 	fmt.Println("\npress Ctrl-C to stop")
 
 	<-ctx.Done()
