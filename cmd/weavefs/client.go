@@ -117,6 +117,16 @@ func (c *client) url(path string, params map[string]string) string {
 	return c.base + path + "?" + q.Encode()
 }
 
+// urlWith builds an endpoint URL from a pre-built set of query values, for the
+// cases where url's map cannot help: a repeated parameter, such as several
+// peers, where one key carries more than one value.
+func (c *client) urlWith(path string, q url.Values) string {
+	if len(q) == 0 {
+		return c.base + path
+	}
+	return c.base + path + "?" + q.Encode()
+}
+
 // errorFromResponse turns a non-2xx reply into a Go error, preferring the
 // server's own JSON message over a bare status code.
 func errorFromResponse(resp *http.Response) error {

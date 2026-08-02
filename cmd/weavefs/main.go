@@ -10,10 +10,16 @@
 //
 // These talk to a node that "serve" is already running:
 //
-//	weavefs put -data DIR <key> <file>     store a file
-//	weavefs get -data DIR <key> [outfile]  fetch a file
-//	weavefs ls  -data DIR <key>            list a key's versions
-//	weavefs rm  -data DIR <key>            drop a key's local copies
+//	weavefs put  -data DIR <key> <file>              store a file
+//	weavefs send -data DIR <target> <key> [file]     give a peer a readable copy
+//	weavefs get  -data DIR <key> [outfile]           fetch a file
+//	weavefs ls   -data DIR <key>                      list a key's versions
+//	weavefs rm   -data DIR <key>                      drop a key's local copies
+//
+// put and send are the two ways to move a file to another machine, and they are
+// deliberately different. put keeps the file for this node and scatters
+// unreadable custodian copies to peers — a backup. send hands a chosen peer a
+// readable copy it will own — a handover, and one that cannot be recalled.
 //
 // The second group does not start a node of its own, and that distinction is
 // the reason those commands took so long to arrive. A "put" that quietly
@@ -75,6 +81,8 @@ func main() {
 		err = runID(os.Args[2:])
 	case "put":
 		err = runPut(os.Args[2:])
+	case "send":
+		err = runSend(os.Args[2:])
 	case "get":
 		err = runGet(os.Args[2:])
 	case "ls":
@@ -103,10 +111,15 @@ Running a node:
   weavefs id    -data DIR          print this node's PeerID and addresses
 
 Using a node that "serve" is already running:
-  weavefs put -data DIR KEY FILE   store a file, and report where it went
-  weavefs get -data DIR KEY [OUT]  fetch a file (stdout if OUT is omitted)
-  weavefs ls  -data DIR KEY        list every version of a key
-  weavefs rm  -data DIR KEY        delete a key's local copies
+  weavefs put  -data DIR KEY FILE       store a file (peers keep an unreadable copy)
+  weavefs send -data DIR TARGET KEY [FILE]  give a peer a readable copy it will own
+  weavefs get  -data DIR KEY [OUT]      fetch a file (stdout if OUT is omitted)
+  weavefs ls   -data DIR KEY            list every version of a key
+  weavefs rm   -data DIR KEY            delete a key's local copies
+
+put vs send:
+  put   keeps the file for you; peers hold ciphertext only you can read — a backup.
+  send  hands a chosen peer a readable copy it owns — a handover, and final.
 
 Flags for serve:
   -data DIR        node directory, holding identity.key, encryption.key and blobs
@@ -115,10 +128,16 @@ Flags for serve:
   -api ADDR        address for the local client API (default 127.0.0.1:0)
   -no-mdns         disable local-network discovery
 
+Targeting a send (choose exactly one):
+  -peer PID        a specific peer's PeerID; may be repeated for several peers
+  -n COUNT         any COUNT of the connected peers
+  -all             every connected peer
+
 Flags for the client commands:
   -data DIR        the directory of the running node to talk to
-  -m MESSAGE       (put) a note describing this version, like a commit message
-  -version ID      (get) fetch one specific version instead of the latest
+  -m MESSAGE       (put, send) a note describing this version, like a commit message
+  -version ID      (get, send) one specific version instead of the latest
+  -as KEY          (send) the key the recipient files it under (default: same key)
 
 Getting started — three terminals:
   1  weavefs serve -data node_a

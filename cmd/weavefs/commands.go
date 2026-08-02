@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -111,6 +113,170 @@ func printWriteResult(r writeResult) {
 
 	for _, f := range r.Failures {
 		fmt.Printf("  %s did not take a copy: %s\n", short(f.Peer), f.Error)
+	}
+}
+
+// runSend hands a readable copy of a file to one or more peers.
+//
+// This is the deliberate counterpart to put. put keeps a file for you and
+// scatters unreadable custodian copies of it; send gives a file away, decrypted,
+// to peers that will own and be able to read it. Once sent, it cannot be
+// recalled — a decentralised system has no way to reach into another machine and
+// take bytes back.
+//
+//	weavefs send -data DIR [ -peer PID | -n N | -all ] <key> [file]
+//
+// With a file argument the file is a loose one off disk, filed under <key>.
+// Without one, <key> names a file already in this node's store.
+func runSend(args []string) error {
+	fs := flag.NewFlagSet("send", flag.ExitOnError)
+	dataDir := fs.String("data", "weavefs_data", "node directory")
+	message := fs.String("m", "", "a note describing this version, like a commit message")
+	version := fs.String("version", "", "a specific version ID to send (default: the latest)")
+	as := fs.String("as", "", "the key the recipient files it under (default: the same key)")
+	count := fs.Int("n", 0, "send to this many connected peers")
+	all := fs.Bool("all", false, "send to every connected peer")
+
+	var peers repeatedFlag
+	fs.Var(&peers, "peer", "a specific peer PeerID to send to; may be repeated")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 || fs.NArg() > 2 {
+		return fmt.Errorf("usage: weavefs send -data DIR [-peer PID | -n N | -all] <key> [file]")
+	}
+	if err := checkOneTarget(peers, *count, *all); err != nil {
+		return err
+	}
+	key := fs.Arg(0)
+
+	c, err := newClient(*dataDir)
+	if err != nil {
+		return err
+	}
+
+	q := url.Values{}
+	q.Set("key", key)
+	if *message != "" {
+		q.Set("message", *message)
+	}
+	if *version != "" {
+		q.Set("version", *version)
+	}
+	if *as != "" {
+		q.Set("as", *as)
+	}
+	for _, p := range peers {
+		q.Add("peer", p)
+	}
+	if *count > 0 {
+		q.Set("n", strconv.Itoa(*count))
+	}
+	if *all {
+		q.Set("all", "true")
+	}
+
+	// A file argument means a loose file: stream it as the request body. No file
+	// argument shares a key already in the node's store, and sends no body.
+	var body io.Reader
+	var contentLength int64 = -1
+	if fs.NArg() == 2 {
+		path := fs.Arg(1)
+		file, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("cannot read %s: %w", path, err)
+		}
+		defer file.Close()
+
+		body = file
+		if info, err := file.Stat(); err == nil {
+			contentLength = info.Size()
+		}
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.urlWith("/v1/share", q), body)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/octet-stream")
+		if contentLength >= 0 {
+			req.ContentLength = contentLength
+		}
+	}
+
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return errorFromResponse(resp)
+	}
+
+	var result shareResult
+	if err := decodeJSON(resp, &result); err != nil {
+		return err
+	}
+
+	printShareResult(result)
+	return nil
+}
+
+// checkOneTarget requires exactly one way of naming who receives a share, so a
+// forgotten target does not silently send to nobody and two targets do not
+// contradict each other.
+func checkOneTarget(peers repeatedFlag, count int, all bool) error {
+	modes := 0
+	if len(peers) > 0 {
+		modes++
+	}
+	if count > 0 {
+		modes++
+	}
+	if all {
+		modes++
+	}
+
+	switch {
+	case modes == 0:
+		return fmt.Errorf("name a target: -peer <PeerID> (repeatable), -n <count>, or -all")
+	case modes > 1:
+		return fmt.Errorf("use only one of -peer, -n, or -all")
+	}
+	return nil
+}
+
+// shareResult mirrors the JSON the API returns from a share.
+type shareResult struct {
+	Key         string `json:"key"`
+	PeersTried  int    `json:"peers_tried"`
+	PeersStored int    `json:"peers_stored"`
+	Placements  []struct {
+		Peer      string `json:"peer"`
+		VersionID string `json:"version_id"`
+		Seq       int    `json:"seq"`
+	} `json:"placements"`
+	Failures []struct {
+		Peer  string `json:"peer"`
+		Error string `json:"error"`
+	} `json:"failures"`
+}
+
+// printShareResult reports which peers took the file and as which version, and
+// which did not and why.
+func printShareResult(r shareResult) {
+	if r.PeersStored == 0 {
+		fmt.Printf("shared %s with 0 of %s — nobody took it\n", r.Key, plural(r.PeersTried, "peer"))
+	} else {
+		fmt.Printf("shared %s with %d of %s\n", r.Key, r.PeersStored, plural(r.PeersTried, "peer"))
+	}
+
+	for _, p := range r.Placements {
+		fmt.Printf("  %s stored it as v%d\n", short(p.Peer), p.Seq)
+	}
+	for _, f := range r.Failures {
+		fmt.Printf("  %s did not take it: %s\n", short(f.Peer), f.Error)
 	}
 }
 
