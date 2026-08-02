@@ -87,6 +87,57 @@ type GetRequest struct {
 	VersionID string `json:"version_id,omitempty"`
 }
 
+// ShareRequest hands a peer a readable file to keep as its own. The file's
+// plaintext bytes follow this header on the same stream.
+//
+// This is the counterpart to StoreRequest, and the differences are the whole
+// point. A StoreRequest carries an OriginID, because a custodian files the blob
+// under the *sender's* namespace and keeps it sealed. A ShareRequest carries no
+// such field: the recipient files the file under its *own* namespace, encrypts
+// it under its *own* key, and owns it outright. There is nobody else's namespace
+// to name.
+//
+// Like every request here, it names no sender. libp2p's Noise handshake already
+// proved which peer is on the other end, and that proof is read from the
+// connection (stream.Conn().RemotePeer()), never trusted from the message body.
+type ShareRequest struct {
+	// Key is the name the recipient will file the file under, in its own
+	// namespace. If the recipient already owns a key by this name, the shared
+	// file becomes a new version of it.
+	Key string `json:"key"`
+
+	// Message is the optional note the sender attached, recorded as the new
+	// version's message the way a commit message is attached to a commit.
+	Message string `json:"message,omitempty"`
+
+	// SizeBytes is how many plaintext bytes follow on this stream. The recipient
+	// reads exactly this many and refuses a transfer that falls short, since a
+	// truncated file would otherwise decrypt to a smaller-but-valid-looking one.
+	//
+	// Unlike a custodian transfer there is no separate blob length: the recipient
+	// re-encrypts as it stores, so the bytes on the wire and the bytes the user
+	// means by "the file" are the same plaintext, and one number describes both.
+	SizeBytes int64 `json:"size_bytes"`
+}
+
+// ShareResponse reports whether the recipient accepted a shared file and, if so,
+// what it named the version it created.
+type ShareResponse struct {
+	OK bool `json:"ok"`
+
+	// VersionID is the version the recipient created, so the sender can report
+	// where its file landed. Empty on failure.
+	VersionID string `json:"version_id,omitempty"`
+
+	// Seq is the recipient's human-readable counter for that version. Display
+	// only, and node-local: it is the recipient's sequence number, never to be
+	// compared against the sender's. Empty (zero) on failure.
+	Seq int `json:"seq,omitempty"`
+
+	// Error explains a refusal or a failure. Empty when OK is true.
+	Error string `json:"error,omitempty"`
+}
+
 // GetResponse answers a GetRequest. When Found is true the blob's bytes follow
 // this header on the same stream.
 type GetResponse struct {

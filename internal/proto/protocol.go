@@ -52,4 +52,17 @@ const (
 	// carries a GetRequest, then a GetResponse comes back, followed by the blob
 	// if the peer had it.
 	GetProtocol protocol.ID = "/weavefs/get/1.0.0"
+
+	// ShareProtocol hands a peer a readable file it will own, as opposed to the
+	// unreadable custodian copy StoreProtocol delivers. The stream carries a
+	// ShareRequest, then the file's plaintext, then a ShareResponse comes back.
+	//
+	// The bytes on this stream are plaintext, not ciphertext: the sender
+	// decrypts before sending so the recipient can re-encrypt under its own key
+	// and read the file. That is safe because libp2p's Noise handshake already
+	// encrypts every connection, so nothing but the recipient ever sees them.
+	// This is the one protocol here whose body is not the sender's ciphertext,
+	// which is exactly why it is a protocol of its own rather than a flag on
+	// StoreProtocol.
+	ShareProtocol protocol.ID = "/weavefs/share/1.0.0"
 )
