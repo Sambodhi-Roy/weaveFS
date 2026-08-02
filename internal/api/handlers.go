@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"github.com/Sambodhi-Roy/weaveFS/internal/server"
 	"github.com/Sambodhi-Roy/weaveFS/internal/store"
 )
@@ -31,6 +33,7 @@ func (a *API) routes() http.Handler {
 	mux.HandleFunc("PUT /v1/files", a.handlePut)
 	mux.HandleFunc("GET /v1/files", a.handleGet)
 	mux.HandleFunc("DELETE /v1/files", a.handleDelete)
+	mux.HandleFunc("POST /v1/share", a.handleShare)
 	mux.HandleFunc("GET /v1/versions", a.handleVersions)
 	mux.HandleFunc("GET /v1/id", a.handleID)
 
@@ -127,6 +130,91 @@ func (a *API) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// shareResultJSON is the JSON shape of a server.ShareResult.
+type shareResultJSON struct {
+	Key         string          `json:"key"`
+	PeersTried  int             `json:"peers_tried"`
+	PeersStored int             `json:"peers_stored"`
+	Placements  []placementJSON `json:"placements,omitempty"`
+	Failures    []failureJSON   `json:"failures,omitempty"`
+}
+
+// placementJSON records where one peer filed a shared file.
+type placementJSON struct {
+	Peer      string `json:"peer"`
+	VersionID string `json:"version_id"`
+	Seq       int    `json:"seq"`
+}
+
+// handleShare sends a readable copy of a file to one or more peers.
+//
+// It carries two shapes on one endpoint, told apart by whether the request has a
+// body. With a body, the body is a loose file: it is stored locally under the
+// key first (without custodian replication) and then shared. Without a body, an
+// existing stored key is shared as-is.
+func (a *API) handleShare(w http.ResponseWriter, r *http.Request) {
+	key, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	message := q.Get("message")
+	version := q.Get("version")
+	destKey := q.Get("as")
+
+	targets, err := a.parseTargets(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// A body means a loose file that is not yet in the store. Bring it in first,
+	// locally only, so the share below can re-read it per peer.
+	if r.ContentLength != 0 {
+		if _, err := a.cfg.FileServer.StoreLocal(key, message, r.Body); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+
+	result, err := a.cfg.FileServer.Share(r.Context(), targets, key, version, destKey, message)
+	if err != nil {
+		// The source key is not on this node, or its version could not be read.
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toShareResultJSON(key, result))
+}
+
+// parseTargets reads the targeting choice from the query string and resolves it
+// to concrete peers. Exactly one of peer / n / all is expected.
+func (a *API) parseTargets(r *http.Request) ([]peer.ID, error) {
+	q := r.URL.Query()
+
+	var explicit []peer.ID
+	for _, ps := range q["peer"] {
+		pid, err := peer.Decode(ps)
+		if err != nil {
+			return nil, fmt.Errorf("invalid peer id %q: %w", ps, err)
+		}
+		explicit = append(explicit, pid)
+	}
+
+	count := 0
+	if s := q.Get("n"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("n must be a positive integer, got %q", s)
+		}
+		count = n
+	}
+
+	all := q.Get("all") == "true"
+
+	return a.cfg.FileServer.ResolveTargets(explicit, count, all)
+}
+
 // handleDelete removes every local version of a key.
 func (a *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 	key, ok := requireKey(w, r)
@@ -212,6 +300,30 @@ func toWriteResultJSON(key string, r server.WriteResult) writeResultJSON {
 		PeersStored: r.PeersStored,
 	}
 
+	for _, f := range r.Failures {
+		out.Failures = append(out.Failures, failureJSON{
+			Peer:  f.Peer.String(),
+			Error: f.Err.Error(),
+		})
+	}
+	return out
+}
+
+// toShareResultJSON flattens a ShareResult for the wire.
+func toShareResultJSON(key string, r server.ShareResult) shareResultJSON {
+	out := shareResultJSON{
+		Key:         key,
+		PeersTried:  r.PeersTried,
+		PeersStored: r.PeersStored,
+	}
+
+	for _, p := range r.Placements {
+		out.Placements = append(out.Placements, placementJSON{
+			Peer:      p.Peer.String(),
+			VersionID: p.VersionID,
+			Seq:       p.Seq,
+		})
+	}
 	for _, f := range r.Failures {
 		out.Failures = append(out.Failures, failureJSON{
 			Peer:  f.Peer.String(),
