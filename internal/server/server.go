@@ -105,6 +105,35 @@ type ReplicaFailure struct {
 	Err  error
 }
 
+// ShareResult reports how a readable file fared as it was handed to peers.
+//
+// Unlike a custodian write it has no local half: a share stores nothing new on
+// this node, it only sends. Every field describes what happened on the network.
+type ShareResult struct {
+	// PeersTried is how many peers the file was offered to.
+	PeersTried int
+
+	// PeersStored is how many of them accepted and stored it.
+	PeersStored int
+
+	// Placements records, for each peer that accepted, the version that peer
+	// created in its own store. Its length is PeersStored.
+	Placements []SharePlacement
+
+	// Failures names every peer that did not take the file, and why. Its length
+	// is PeersTried minus PeersStored.
+	Failures []ReplicaFailure
+}
+
+// SharePlacement records where one peer filed a shared file. VersionID and Seq
+// are the recipient's own — the Seq is that peer's local counter and must not be
+// compared against this node's.
+type SharePlacement struct {
+	Peer      peer.ID
+	VersionID string
+	Seq       int
+}
+
 // FileServer answers requests from peers and makes them on this node's behalf.
 type FileServer struct {
 	cfg Config
@@ -155,9 +184,10 @@ func (s *FileServer) Start() error {
 		h := s.cfg.Node.Host()
 		h.SetStreamHandler(proto.StoreProtocol, s.handleStore)
 		h.SetStreamHandler(proto.GetProtocol, s.handleGet)
+		h.SetStreamHandler(proto.ShareProtocol, s.handleShare)
 
-		log.Printf("[server] %s serving %s and %s",
-			s.nodeID, proto.StoreProtocol, proto.GetProtocol)
+		log.Printf("[server] %s serving %s, %s and %s",
+			s.nodeID, proto.StoreProtocol, proto.GetProtocol, proto.ShareProtocol)
 	})
 	return nil
 }
@@ -170,6 +200,7 @@ func (s *FileServer) Close() error {
 		h := s.cfg.Node.Host()
 		h.RemoveStreamHandler(proto.StoreProtocol)
 		h.RemoveStreamHandler(proto.GetProtocol)
+		h.RemoveStreamHandler(proto.ShareProtocol)
 	})
 	return nil
 }
@@ -203,6 +234,22 @@ func (s *FileServer) StoreVersion(ctx context.Context, key, message string, r io
 	result := s.replicate(ctx, key, entry)
 	result.Entry = entry
 	return result, nil
+}
+
+// StoreLocal writes a file to this node's disk and returns the version created,
+// without replicating it to any peer.
+//
+// It exists for the loose-file case of a share: to send a file that is not yet
+// in the store, the file must first be brought into the store so the fan-out can
+// re-read it per peer. Using this rather than Store keeps "send this file to one
+// peer" from also scattering custodian copies of it to every other connected
+// peer, which would be a surprising side effect of a targeted share.
+func (s *FileServer) StoreLocal(key, message string, r io.Reader) (store.VersionEntry, error) {
+	entry, err := s.cfg.Store.WriteVersion(s.nodeID, key, message, r)
+	if err != nil {
+		return store.VersionEntry{}, fmt.Errorf("server: StoreLocal %q: %w", key, err)
+	}
+	return entry, nil
 }
 
 // replicate sends one version to every selected peer, concurrently, and waits
@@ -359,6 +406,175 @@ func (s *FileServer) GetVersion(ctx context.Context, key, versionID string) (int
 
 	return 0, nil, fmt.Errorf("server: Get %q: none of the %d connected peers hold it",
 		key, len(peers))
+}
+
+// Share hands a readable copy of one of this node's files to each target peer.
+//
+// It is the counterpart to Store. Store keeps a file for this node and scatters
+// unreadable custodian copies of it; Share gives a file away — decrypted — to
+// peers that will own it and be able to read it. srcKey names a file already in
+// this node's store; destKey is the name each recipient files it under
+// (defaulting to srcKey when empty); an empty versionID shares the latest
+// version; message is an optional note recorded on the recipient's new version.
+//
+// The returned error is about the source, not the network: if this node cannot
+// read srcKey, no peer is contacted and the error says so. Once the file is
+// readable, each peer is best effort, and its outcome — accepted as which
+// version, or failed and why — is recorded in the ShareResult.
+func (s *FileServer) Share(ctx context.Context, targets []peer.ID, srcKey, versionID, destKey, message string) (ShareResult, error) {
+	if destKey == "" {
+		destKey = srcKey
+	}
+
+	// Fail before opening a single stream if the file is not here, so a share of
+	// a key this node does not hold is a clear error rather than a row of
+	// identical per-peer failures.
+	if !s.cfg.Store.Has(s.nodeID, srcKey) {
+		return ShareResult{}, fmt.Errorf("server: Share %q: not stored on this node", srcKey)
+	}
+	if len(targets) == 0 {
+		return ShareResult{}, fmt.Errorf("server: Share %q: no target peers", srcKey)
+	}
+
+	// Each goroutine writes to its own slot, so no lock is needed: the slices are
+	// never resized and no two goroutines touch the same element. A nil error
+	// slot means that peer succeeded, and its placement slot is then set.
+	placements := make([]*SharePlacement, len(targets))
+	errs := make([]error, len(targets))
+
+	var wg sync.WaitGroup
+	for i, p := range targets {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			placement, err := s.sendReadable(ctx, p, srcKey, versionID, destKey, message)
+			if err != nil {
+				log.Printf("[server] sharing %q to %s failed: %v", srcKey, p, err)
+				errs[i] = err
+				return
+			}
+			placements[i] = placement
+			log.Printf("[server] shared %q to %s as version %s (seq %d)",
+				srcKey, p, placement.VersionID, placement.Seq)
+		}()
+	}
+	wg.Wait()
+
+	result := ShareResult{PeersTried: len(targets)}
+	for i := range targets {
+		if errs[i] != nil {
+			result.Failures = append(result.Failures, ReplicaFailure{Peer: targets[i], Err: errs[i]})
+			continue
+		}
+		result.PeersStored++
+		result.Placements = append(result.Placements, *placements[i])
+	}
+	return result, nil
+}
+
+// sendReadable streams one file's plaintext to one peer and reports the version
+// the peer created for it.
+//
+// The file is read — and therefore decrypted — once per peer rather than
+// buffered and shared, for the same reason sendBlob re-reads per peer: a file
+// server that holds every file it sends in memory falls over on the first large
+// one.
+func (s *FileServer) sendReadable(ctx context.Context, to peer.ID, srcKey, versionID, destKey, message string) (*SharePlacement, error) {
+	size, rc, err := s.cfg.Store.ReadVersion(s.nodeID, srcKey, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("reading local file: %w", err)
+	}
+	defer rc.Close()
+
+	stream, err := s.cfg.Node.Host().NewStream(ctx, to, proto.ShareProtocol)
+	if err != nil {
+		return nil, fmt.Errorf("opening stream: %w", err)
+	}
+	defer stream.Close()
+
+	if err := stream.SetDeadline(time.Now().Add(s.cfg.RequestTimeout)); err != nil {
+		return nil, fmt.Errorf("setting deadline: %w", err)
+	}
+
+	req := proto.ShareRequest{Key: destKey, Message: message, SizeBytes: size}
+	if err := proto.WriteMessage(stream, req); err != nil {
+		_ = stream.Reset()
+		return nil, err
+	}
+
+	// The bytes leaving here are plaintext: ReadVersion decrypted them, and Noise
+	// re-encrypts them for the wire so only the recipient sees them.
+	if _, err := io.Copy(stream, rc); err != nil {
+		_ = stream.Reset()
+		return nil, fmt.Errorf("sending file: %w", err)
+	}
+
+	// Half-close: nothing more to send, but we still want the reply.
+	if err := stream.CloseWrite(); err != nil {
+		_ = stream.Reset()
+		return nil, fmt.Errorf("closing the write side: %w", err)
+	}
+
+	var resp proto.ShareResponse
+	if err := proto.ReadMessage(stream, &resp); err != nil {
+		_ = stream.Reset()
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if !resp.OK {
+		return nil, fmt.Errorf("peer refused: %s", resp.Error)
+	}
+
+	return &SharePlacement{Peer: to, VersionID: resp.VersionID, Seq: resp.Seq}, nil
+}
+
+// ResolveTargets turns a targeting choice into the concrete peers a Share will
+// contact. Exactly one of the three inputs is meant to be set:
+//
+//   - explicit: send to these specific peers, each of which must be connected;
+//   - count > 0: send to any count of the connected peers;
+//   - all: send to every connected peer.
+//
+// It returns an error rather than quietly sending to nobody, because a share
+// aimed at a peer that is not there is a mistake worth reporting to the person
+// who asked for it.
+func (s *FileServer) ResolveTargets(explicit []peer.ID, count int, all bool) ([]peer.ID, error) {
+	connected := s.cfg.Node.Peers()
+
+	switch {
+	case len(explicit) > 0:
+		return requireConnected(explicit, connected)
+	case all:
+		if len(connected) == 0 {
+			return nil, fmt.Errorf("server: no peers are connected to share with")
+		}
+		return connected, nil
+	case count > 0:
+		if len(connected) == 0 {
+			return nil, fmt.Errorf("server: no peers are connected to share with")
+		}
+		if count > len(connected) {
+			count = len(connected)
+		}
+		return connected[:count], nil
+	default:
+		return nil, fmt.Errorf("server: no target given: name a peer, a count, or all")
+	}
+}
+
+// requireConnected returns want unchanged if every peer in it is currently
+// connected, or an error naming the first one that is not.
+func requireConnected(want, connected []peer.ID) ([]peer.ID, error) {
+	set := make(map[peer.ID]struct{}, len(connected))
+	for _, p := range connected {
+		set[p] = struct{}{}
+	}
+	for _, p := range want {
+		if _, ok := set[p]; !ok {
+			return nil, fmt.Errorf("server: peer %s is not connected", p)
+		}
+	}
+	return want, nil
 }
 
 // Delete removes every version of one of this node's own keys from local disk.

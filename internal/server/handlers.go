@@ -162,6 +162,82 @@ func (s *FileServer) handleGet(stream network.Stream) {
 	log.Printf("[server] served %d bytes of %q to %s", n, req.Key, from)
 }
 
+// handleShare accepts a readable file from a peer and files it under this node's
+// own namespace, encrypted under this node's own key, as a version this node
+// owns outright.
+//
+// This is the mirror image of handleStore. handleStore writes a peer's
+// ciphertext verbatim under the *peer's* namespace and can never read it;
+// handleShare writes the peer's plaintext through the ordinary encrypting path
+// under *our* namespace, so the file becomes ours to read. The bytes on the
+// stream are plaintext precisely because the sender decrypted them first, which
+// libp2p's Noise handshake keeps private in transit.
+func (s *FileServer) handleShare(stream network.Stream) {
+	defer stream.Close()
+
+	from := stream.Conn().RemotePeer()
+
+	if err := stream.SetDeadline(time.Now().Add(s.cfg.RequestTimeout)); err != nil {
+		log.Printf("[server] could not set a deadline for %s: %v", from, err)
+		_ = stream.Reset()
+		return
+	}
+
+	var req proto.ShareRequest
+	if err := proto.ReadMessage(stream, &req); err != nil {
+		log.Printf("[server] unreadable share request from %s: %v", from, err)
+		_ = stream.Reset()
+		return
+	}
+
+	if err := s.cfg.Authorizer.AllowShare(from, req.Key); err != nil {
+		log.Printf("[server] refused %s permission to share %q: %v", from, req.Key, err)
+		s.reply(stream, proto.ShareResponse{Error: "not authorised to share here"})
+		return
+	}
+
+	if req.SizeBytes < 0 {
+		log.Printf("[server] %s announced a negative file size (%d)", from, req.SizeBytes)
+		s.reply(stream, proto.ShareResponse{Error: "invalid file size"})
+		return
+	}
+
+	// LimitReader stops the copy at exactly the promised length so a peer cannot
+	// keep streaming and fill this node's disk; the counter then checks the other
+	// direction, that it sent everything it promised.
+	//
+	// WriteVersion files the bytes under this node's own ID, so the store
+	// encrypts them under this node's key and records a version this node owns.
+	// If this node already owns a key by this name, WriteVersion appends a new
+	// version of it rather than replacing it — the shared file becomes the
+	// latest and the earlier versions remain. That is deliberate, not incidental.
+	body := &countingReader{r: io.LimitReader(stream, req.SizeBytes)}
+
+	entry, err := s.cfg.Store.WriteVersion(s.nodeID, req.Key, req.Message, body)
+	if err != nil {
+		log.Printf("[server] storing shared %q from %s failed: %v", req.Key, from, err)
+		s.reply(stream, proto.ShareResponse{Error: "could not store the file"})
+		return
+	}
+
+	if body.n != req.SizeBytes {
+		// A truncated file must not be kept as if it were whole. Encryption
+		// provides no integrity check, so a short file would later decrypt to a
+		// short plaintext with no error raised anywhere.
+		log.Printf("[server] %s promised %d bytes of shared %q but sent %d; discarding",
+			from, req.SizeBytes, req.Key, body.n)
+
+		_ = s.cfg.Store.DeleteVersion(s.nodeID, req.Key, entry.VersionID)
+		s.reply(stream, proto.ShareResponse{Error: "incomplete file"})
+		return
+	}
+
+	log.Printf("[server] accepted shared %q from %s as version %s (seq %d), %d bytes",
+		req.Key, from, entry.VersionID, entry.Seq, body.n)
+
+	s.reply(stream, proto.ShareResponse{OK: true, VersionID: entry.VersionID, Seq: entry.Seq})
+}
+
 // reply sends a final response and resets the stream if it cannot be delivered.
 //
 // It takes any message type because both handlers do the same thing with their

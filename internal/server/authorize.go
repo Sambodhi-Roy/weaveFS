@@ -20,6 +20,15 @@ type Authorizer interface {
 	// AllowGet decides whether `from` may retrieve a blob this node is holding
 	// under originID's namespace.
 	AllowGet(from peer.ID, originID, key string) error
+
+	// AllowShare decides whether `from` may hand this node a readable file to
+	// keep as its own, filed under key in this node's namespace.
+	//
+	// This is a distinct decision from AllowStore, which accepts an unreadable
+	// custodian blob. Accepting a readable file means writing bytes a peer chose
+	// into this node's own store under a name the peer chose, so a real policy
+	// may well answer these two questions differently — hence a gate of its own.
+	AllowShare(from peer.ID, key string) error
 }
 
 // AllowAll permits every operation from every peer, and is what a FileServer
@@ -43,3 +52,6 @@ func (AllowAll) AllowStore(peer.ID, string, string) error { return nil }
 
 // AllowGet permits every get request.
 func (AllowAll) AllowGet(peer.ID, string, string) error { return nil }
+
+// AllowShare permits every share request.
+func (AllowAll) AllowShare(peer.ID, string) error { return nil }
