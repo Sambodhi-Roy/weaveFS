@@ -89,6 +89,12 @@ func main() {
 		err = runList(os.Args[2:])
 	case "rm":
 		err = runRemove(os.Args[2:])
+	case "alias":
+		err = runAlias(os.Args[2:])
+	case "aliases":
+		err = runAliases(os.Args[2:])
+	case "disconnect":
+		err = runDisconnect(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -102,6 +108,16 @@ func main() {
 	}
 }
 
+// defaultDataDir is the node directory used when -data is not given: the
+// WEAVEFS_DATA environment variable if set, otherwise "weavefs_data". This lets
+// a user pick a node directory once per shell instead of on every command.
+func defaultDataDir() string {
+	if dir := os.Getenv("WEAVEFS_DATA"); dir != "" {
+		return dir
+	}
+	return "weavefs_data"
+}
+
 func usage() {
 	fmt.Print(`weaveFS — a distributed file system
 
@@ -113,9 +129,12 @@ Running a node:
 Using a node that "serve" is already running:
   weavefs put  -data DIR KEY FILE       store a file (peers keep an unreadable copy)
   weavefs send -data DIR TARGET KEY [FILE]  give a peer a readable copy it will own
-  weavefs get  -data DIR KEY [OUT]      fetch a file (stdout if OUT is omitted)
-  weavefs ls   -data DIR KEY            list every version of a key
-  weavefs rm   -data DIR KEY            delete a key's local copies
+  weavefs get        -data DIR KEY [OUT]      fetch a file (stdout if OUT is omitted)
+  weavefs ls         -data DIR KEY            list every version of a key
+  weavefs rm         -data DIR KEY            delete a key's local copies
+  weavefs alias      -data DIR PID NAME       assign a readable name to a Peer ID
+  weavefs aliases    -data DIR                list all saved aliases
+  weavefs disconnect -data DIR PID            explicitly close a connection to a peer
 
 put vs send:
   put   keeps the file for you; peers hold ciphertext only you can read — a backup.
@@ -138,6 +157,14 @@ Flags for the client commands:
   -m MESSAGE       (put, send) a note describing this version, like a commit message
   -version ID      (get, send) one specific version instead of the latest
   -as KEY          (send) the key the recipient files it under (default: same key)
+
+Less typing:
+  Run "make install" once, then "weavefs" works from any directory.
+  Set WEAVEFS_DATA to a node directory to make it the -data default for this
+  shell, so you can drop -data from every command:
+    PowerShell   $env:WEAVEFS_DATA = "node_a"
+    bash         export WEAVEFS_DATA=node_a
+  An explicit -data still overrides it.
 
 Getting started — three terminals:
   1  weavefs serve -data node_a
@@ -406,7 +433,7 @@ func (r *repeatedFlag) Set(value string) error {
 
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	dataDir := fs.String("data", "weavefs_data", "node directory")
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
 	listen := fs.String("listen", "/ip4/0.0.0.0/tcp/0", "multiaddr to listen on")
 	apiAddr := fs.String("api", api.DefaultAddr, "address for the local client API")
 	noMDNS := fs.Bool("no-mdns", false, "disable local-network discovery")
@@ -502,7 +529,7 @@ func dialPeer(ctx context.Context, w *weaveNode, addr string) error {
 
 func runID(args []string) error {
 	fs := flag.NewFlagSet("id", flag.ExitOnError)
-	dataDir := fs.String("data", "weavefs_data", "node directory")
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
 
 	if err := fs.Parse(args); err != nil {
 		return err

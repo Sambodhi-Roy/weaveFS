@@ -4,12 +4,14 @@ package main
 // flag set, a client, one HTTP call and some printing.
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +22,7 @@ import (
 //	weavefs put -data DIR <key> <file>
 func runPut(args []string) error {
 	fs := flag.NewFlagSet("put", flag.ExitOnError)
-	dataDir := fs.String("data", "weavefs_data", "node directory")
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
 	message := fs.String("m", "", "a message describing this version, like a commit message")
 
 	if err := fs.Parse(args); err != nil {
@@ -72,7 +74,7 @@ func runPut(args []string) error {
 		return err
 	}
 
-	printWriteResult(result)
+	printWriteResult(result, loadAliases(*dataDir))
 	return nil
 }
 
@@ -98,7 +100,7 @@ type writeResult struct {
 // the user cannot otherwise know is whether the file reached anybody else, and
 // silence there would read as success — which is exactly the lie this command
 // was held back for until the file server could answer the question.
-func printWriteResult(r writeResult) {
+func printWriteResult(r writeResult, aliases map[string]string) {
 	fmt.Printf("stored %s v%d (%s) locally\n", r.Key, r.Seq, humanBytes(r.SizeBytes))
 
 	switch {
@@ -112,7 +114,7 @@ func printWriteResult(r writeResult) {
 	}
 
 	for _, f := range r.Failures {
-		fmt.Printf("  %s did not take a copy: %s\n", short(f.Peer), f.Error)
+		fmt.Printf("  %s did not take a copy: %s\n", formatPeer(f.Peer, aliases), f.Error)
 	}
 }
 
@@ -130,7 +132,7 @@ func printWriteResult(r writeResult) {
 // Without one, <key> names a file already in this node's store.
 func runSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
-	dataDir := fs.String("data", "weavefs_data", "node directory")
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
 	message := fs.String("m", "", "a note describing this version, like a commit message")
 	version := fs.String("version", "", "a specific version ID to send (default: the latest)")
 	as := fs.String("as", "", "the key the recipient files it under (default: the same key)")
@@ -219,7 +221,7 @@ func runSend(args []string) error {
 		return err
 	}
 
-	printShareResult(result)
+	printShareResult(result, loadAliases(*dataDir))
 	return nil
 }
 
@@ -265,7 +267,7 @@ type shareResult struct {
 
 // printShareResult reports which peers took the file and as which version, and
 // which did not and why.
-func printShareResult(r shareResult) {
+func printShareResult(r shareResult, aliases map[string]string) {
 	if r.PeersStored == 0 {
 		fmt.Printf("shared %s with 0 of %s — nobody took it\n", r.Key, plural(r.PeersTried, "peer"))
 	} else {
@@ -273,10 +275,10 @@ func printShareResult(r shareResult) {
 	}
 
 	for _, p := range r.Placements {
-		fmt.Printf("  %s stored it as v%d\n", short(p.Peer), p.Seq)
+		fmt.Printf("  %s stored it as v%d\n", formatPeer(p.Peer, aliases), p.Seq)
 	}
 	for _, f := range r.Failures {
-		fmt.Printf("  %s did not take it: %s\n", short(f.Peer), f.Error)
+		fmt.Printf("  %s did not take it: %s\n", formatPeer(f.Peer, aliases), f.Error)
 	}
 }
 
@@ -286,7 +288,7 @@ func printShareResult(r shareResult) {
 //	weavefs get -data DIR <key> [outfile]
 func runGet(args []string) error {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
-	dataDir := fs.String("data", "weavefs_data", "node directory")
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
 	version := fs.String("version", "", "a specific version ID (default: the latest)")
 
 	if err := fs.Parse(args); err != nil {
@@ -348,7 +350,7 @@ func runGet(args []string) error {
 //	weavefs ls -data DIR <key>
 func runList(args []string) error {
 	fs := flag.NewFlagSet("ls", flag.ExitOnError)
-	dataDir := fs.String("data", "weavefs_data", "node directory")
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -417,7 +419,7 @@ func runList(args []string) error {
 //	weavefs rm -data DIR <key>
 func runRemove(args []string) error {
 	fs := flag.NewFlagSet("rm", flag.ExitOnError)
-	dataDir := fs.String("data", "weavefs_data", "node directory")
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -488,4 +490,124 @@ func short(peerID string) string {
 		return peerID
 	}
 	return "…" + strings.ToLower(peerID[len(peerID)-8:])
+}
+
+// formatPeer returns the alias for a peer if one is set, or the short ID.
+func formatPeer(peerID string, aliases map[string]string) string {
+	if name, ok := aliases[peerID]; ok {
+		return name
+	}
+	return short(peerID)
+}
+
+func loadAliases(dataDir string) map[string]string {
+	aliases := make(map[string]string)
+	path := filepath.Join(dataDir, "aliases.json")
+	data, err := os.ReadFile(path)
+	if err == nil {
+		_ = json.Unmarshal(data, &aliases)
+	}
+	return aliases
+}
+
+func saveAliases(dataDir string, aliases map[string]string) error {
+	path := filepath.Join(dataDir, "aliases.json")
+	data, err := json.MarshalIndent(aliases, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// runAlias assigns a readable name to a Peer ID.
+//
+//	weavefs alias -data DIR <peer_id> <name>
+func runAlias(args []string) error {
+	fs := flag.NewFlagSet("alias", flag.ExitOnError)
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return fmt.Errorf("usage: weavefs alias -data DIR <peer_id> <name>")
+	}
+	peerID, name := fs.Arg(0), fs.Arg(1)
+
+	aliases := loadAliases(*dataDir)
+	aliases[peerID] = name
+	if err := saveAliases(*dataDir, aliases); err != nil {
+		return fmt.Errorf("saving aliases: %w", err)
+	}
+
+	fmt.Printf("alias set: %s -> %s\n", short(peerID), name)
+	return nil
+}
+
+// runAliases lists all saved aliases.
+//
+//	weavefs aliases -data DIR
+func runAliases(args []string) error {
+	fs := flag.NewFlagSet("aliases", flag.ExitOnError)
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: weavefs aliases -data DIR")
+	}
+
+	aliases := loadAliases(*dataDir)
+	if len(aliases) == 0 {
+		fmt.Println("no aliases saved")
+		return nil
+	}
+
+	fmt.Println("Aliases:")
+	for peerID, name := range aliases {
+		fmt.Printf("  %-15s %s\n", name, peerID)
+	}
+	return nil
+}
+
+// runDisconnect explicitly closes a connection to a peer.
+//
+//	weavefs disconnect -data DIR <peer_id>
+func runDisconnect(args []string) error {
+	fs := flag.NewFlagSet("disconnect", flag.ExitOnError)
+	dataDir := fs.String("data", defaultDataDir(), "node directory (or set WEAVEFS_DATA)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: weavefs disconnect -data DIR <peer_id>")
+	}
+	peerID := fs.Arg(0)
+
+	c, err := newClient(*dataDir)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, c.url("/v1/peers", map[string]string{
+		"peer": peerID,
+	}), nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return errorFromResponse(resp)
+	}
+	resp.Body.Close()
+
+	aliases := loadAliases(*dataDir)
+	fmt.Printf("disconnected from %s\n", formatPeer(peerID, aliases))
+	return nil
 }

@@ -205,6 +205,11 @@ func (s *FileServer) Close() error {
 	return nil
 }
 
+// Disconnect explicitly closes the connection to a given peer.
+func (s *FileServer) Disconnect(peerID peer.ID) error {
+	return s.cfg.Node.Host().Network().ClosePeer(peerID)
+}
+
 // Store writes a file to local disk and replicates it to peers.
 //
 // The returned error is about the local write only. If it is nil the file is on

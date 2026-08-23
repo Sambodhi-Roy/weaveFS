@@ -36,6 +36,7 @@ func (a *API) routes() http.Handler {
 	mux.HandleFunc("POST /v1/share", a.handleShare)
 	mux.HandleFunc("GET /v1/versions", a.handleVersions)
 	mux.HandleFunc("GET /v1/id", a.handleID)
+	mux.HandleFunc("DELETE /v1/peers", a.handleDisconnect)
 
 	return logRequests(mux)
 }
@@ -258,6 +259,28 @@ func (a *API) handleID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"peer_id": a.cfg.FileServer.ID(),
 	})
+}
+
+// handleDisconnect explicitly closes the connection to a peer.
+func (a *API) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	peerStr := r.URL.Query().Get("peer")
+	if peerStr == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("the 'peer' query parameter is required"))
+		return
+	}
+
+	pid, err := peer.Decode(peerStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid peer id %q: %w", peerStr, err))
+		return
+	}
+
+	if err := a.cfg.FileServer.Disconnect(pid); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"peer_id": peerStr, "disconnected": true})
 }
 
 // requireKey pulls the mandatory "key" query parameter, answering the request
