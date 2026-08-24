@@ -238,23 +238,23 @@ go test ./internal/store/ -run TestRollbackTo -v
 
 ## Development history
 
-### Week 1 — hand-written TCP transport *(since deleted)*
+### Hand-written TCP transport *(since deleted)*
 
 The first week built a `p2p/` package from scratch: `Peer` and `Transport` interfaces, a 1-byte message-type prefix, a `HandshakeFunc` placeholder, and a `TCPTransport` that paused its read loop with `sync.WaitGroup` during file transfers.
 
-### Weeks 2–3 — content-addressable storage
+### Content-addressable storage
 
 `internal/store` with `CASPathTransformFunc`, `Write`/`Read`/`Has`/`Delete`/`Clear`, then versioning on top: `WriteVersion`/`ReadVersion`/`ListVersions`/`DeleteVersion`/`RollbackTo`. 17 committed tests.
 
-### Segment A — libp2p networking
+### libp2p networking
 
 Hand-written transport replaced with go-libp2p. One stream per request, persistent Ed25519 identity, mDNS discovery, Noise on every connection. The correctness class of bugs that plagued `p2p/` became structurally impossible.
 
-### Segment B — encryption at rest
+### Encryption at rest
 
 `internal/crypto` closes the storage side. AES-256-CTR streaming codec, fresh IV per blob, `WFS1` header for format detection, per-node key, optional via interface. 18 committed tests.
 
-### Segments C and D — node-to-node transfer
+### Node-to-node transfer
 
 `internal/proto` and `internal/server`. The system first did something a single-machine program cannot: store on one node, delete, recover from a peer. Replication, custodian recovery, and a real `demo` subcommand proving the full round trip end to end.
 
@@ -290,11 +290,7 @@ Hand-written transport replaced with go-libp2p. One stream per request, persiste
 | `internal/server` | `FileServer` joining networking to storage: replication, recovery, readable file sharing, per-peer outcome reporting | 0 — see below |
 | `internal/api` | Loopback HTTP API so another process can drive a running node | 0 — see below |
 | `cmd/weavefs` | `demo`, `serve`, `id`, and the client commands `put`, `send`, `get`, `ls`, `rm` | — |
-
-> **On the empty test columns.** Tests were written and run for all four of those packages — 54 of them, all passing — and then deleted before each commit, because the project's working practice is that test files are used to verify a change and do not enter the repository. The most significant consequence is that there is no regression guard against regenerating `identity.key`, which silently orphans every stored file.
+ 
 
 ---
 
-## License
-
-MIT. Built by [@Sambodhi-Roy](https://github.com/Sambodhi-Roy).
