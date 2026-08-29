@@ -1,5 +1,5 @@
 <h1 align="center">weaveFS</h1>
-<p align="center"><b>A distributed file system built incrementally in Go — encryption, versioning, and peer replication from first principles.</b></p>
+<p align="center"><b>A distributed file system built incrementally in Go: encryption, versioning, and peer replication from first principles.</b></p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Go-1.25.7+-00ADD8?logo=go&logoColor=white" alt="Go 1.25.7+">
@@ -277,20 +277,3 @@ Hand-written transport replaced with go-libp2p. One stream per request, persiste
 - **Replication placement.** `put` sends to every peer with no capacity or failure-domain awareness — item 06.
 
 ---
-
-## Package summary
-
-| Package | What it does | Committed tests |
-|---|---|---|
-| `internal/store` | Content-addressable storage, immutable versioning, per-key locking, optional encryption, raw blob paths for replication | 17 |
-| `internal/crypto` | AES-256-CTR encryption at rest, per-node key management | 18 (1 skipped on Windows) |
-| `internal/fsutil` | Atomic file replacement, shared by the two key-file writers | 6 (1 skipped on Windows) |
-| `internal/node` | libp2p host: persistent identity, Noise-encrypted connections, mDNS discovery | 0 — see below |
-| `internal/proto` | The request/response messages nodes exchange, and the frame codec | 0 — see below |
-| `internal/server` | `FileServer` joining networking to storage: replication, recovery, readable file sharing, per-peer outcome reporting | 0 — see below |
-| `internal/api` | Loopback HTTP API so another process can drive a running node | 0 — see below |
-| `cmd/weavefs` | `demo`, `serve`, `id`, and the client commands `put`, `send`, `get`, `ls`, `rm` | — |
- 
-
----
-
